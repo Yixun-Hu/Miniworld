@@ -30,7 +30,10 @@ Basic usage:
 Forwarding convention:
   All arguments after the positional "--" separator are forwarded verbatim to
   `scripts.generate_videos` (single-run). This is the recommended place to set
-  rollout length, policy, rendering resolution, textures, map/debug outputs, etc.
+  rollout length, policy, rendering resolution, textures, map/debug outputs,
+  --k3d-*, --no-depth, and --store-block-info.
+  Use --seed BEFORE the separator to assign base_seed + item_index to each job.
+  A --seed AFTER the separator is forwarded verbatim (the same seed in each job).
 
 Key flags:
   --env-name STR            Environment id passed to each subprocess.
@@ -102,6 +105,7 @@ def main():
     parser.add_argument("--num-processes", type=int, default=4)
     parser.add_argument("--file-digits", type=int, default=4, help="zero-pad width for filenames inside each block")
     parser.add_argument("--python", default=sys.executable, help="python executable to use for subprocesses")
+    parser.add_argument("--seed", type=int, default=None, help="base seed; each subprocess gets seed + item index")
     parser.add_argument(
         "--store-block-info",
         action="store_true",
@@ -116,6 +120,8 @@ def main():
     fwd = list(args.rest)
     if fwd and fwd[0] == "--":
         fwd = fwd[1:]
+    if args.seed is not None and any(arg == "--seed" or arg.startswith("--seed=") for arg in fwd):
+        parser.error("pass --seed before OR after --, not both")
     # If requested, ensure the underlying single-run script gets the flag
     if args.store_block_info and ("--store-block-info" not in fwd):
         fwd = fwd + ["--store-block-info"]
@@ -146,6 +152,8 @@ def main():
             "--out-prefix",
             out_prefix,
         ] + fwd
+        if args.seed is not None:
+            cmd += ["--seed", str(args.seed + idx)]
 
         cmds.append(cmd)
 

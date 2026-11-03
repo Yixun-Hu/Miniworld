@@ -13,7 +13,7 @@ Basic usage:
 
 Outputs (written using <out-prefix>):
   - <out-prefix>_rgb.mp4          RGB rollout video (T frames)
-  - <out-prefix>_depth.pt         Raw depth tensor float32, shape (T,H,W,1)
+  - <out-prefix>_depth.pt         Raw depth tensor float32, shape (T,H,W,1); omitted with --no-depth
   - <out-prefix>_actions.pt       Dict with:
         actions (T,), agent_pos (T,3), delta_xz (T,2), delta_dir (T,), agent_dir (T,)
 
@@ -37,6 +37,8 @@ Key flag groups:
     --grid-mode + --grid-vel-min/max [--grid-cardinal-only], --blocks-static, --num-blocks,
     --num-blocks-min/max, --ensure-base-palette, --block-size-xy, --block-height,
     overlap/orientation flags (e.g., --box-allow-overlap, --agent-box-allow-overlap, --box-random-orientation)
+    --k3d-mode, --k3d-integer, --k3d-speed-min/max, --k3d-accel-min/max,
+    --k3d-vmax, --k3d-bounds LO HI (mutually exclusive with --grid-mode)
 
   Textures:
     --floor-tex, --wall-tex, --ceil-tex, --box-tex, plus randomizers:
@@ -82,6 +84,7 @@ python -m scripts.generate_videos \
 import argparse
 import math
 import os
+import random
 from typing import Tuple, Optional
 
 import gymnasium as gym
@@ -128,10 +131,10 @@ if _HEADLESS_MODE:
 
 import miniworld
 from miniworld.params import DEFAULT_PARAMS
-from miniworld.entity import Box
+from miniworld.entity import Box, Ball
 
 
-def build_env(args) -> gym.Env:
+def build_env(args, count_rng=None) -> gym.Env:
     view_mode = "top" if args.top_view else "agent"
     env_kwargs = {
         "view": view_mode,
@@ -186,13 +189,17 @@ def build_env(args) -> gym.Env:
         env_kwargs["grid_vel_max"] = int(args.grid_vel_max)
         if getattr(args, "grid_cardinal_only", False):
             env_kwargs["grid_cardinal_only"] = True
+    if getattr(args, "k3d_mode", False):
+        for name in ("mode", "integer", "speed_min", "speed_max", "accel_min",
+                     "accel_max", "vmax", "bounds"):
+            env_kwargs[f"k3d_{name}"] = getattr(args, f"k3d_{name}")
     # Block count stochasticity and color palette controls (MovingBlockWorld)
     if getattr(args, "num_blocks", None) is not None:
         env_kwargs["num_blocks"] = int(args.num_blocks)
     if getattr(args, "num_blocks_min", None) is not None and getattr(args, "num_blocks_max", None) is not None:
-        # Defer sampling to env.reset by passing a random value each build
-        import random as _py_random
-        env_kwargs["num_blocks"] = int(_py_random.randint(int(args.num_blocks_min), int(args.num_blocks_max)))
+        # A per-item RNG makes count reproducible without changing global state.
+        rng = count_rng if count_rng is not None else random
+        env_kwargs["num_blocks"] = int(rng.randint(int(args.num_blocks_min), int(args.num_blocks_max)))
     if getattr(args, "ensure_base_palette", False):
         env_kwargs["ensure_base_palette"] = True
     if getattr(args, "blocks_static", False):
@@ -1537,18 +1544,30 @@ def run_rollout(
     observe_steps: int = 5,
     capture_top: bool = False,
     store_block_info: bool = False,
+    capture_depth: bool = True,
+    seed: Optional[int] = None,
 ) -> Tuple[
     np.ndarray,  # rgb
-    np.ndarray,  # depth
+    Optional[np.ndarray],  # depth (None when disabled)
     np.ndarray,  # actions
     np.ndarray,  # top or None
-    np.ndarray,  # agent_pos (T+1,3)
+    np.ndarray,  # agent_pos (T,3)
     np.ndarray,  # delta_xz (T,2)
     np.ndarray,  # delta_dir (T,)
     np.ndarray,  # agent_dir (T,)
     Optional[dict],  # top_view_scale (or None)
     Optional[dict],  # block_info (or None)
 ]:
+    """Capture frame t before actions[t], retaining exactly T frames.
+
+    block_vel_k3d[t] is the velocity used from frame t to t+1, after that
+    step's acceleration kick and before its reflection (not finite differences).
+    block_bounce[t] describes that same outgoing transition; block_speed[t]
+    is the norm of block_vel_k3d[t]. Acceleration and positions belong to frame
+    t. Positions keep the existing (T,N,3) XYZ schema, using k3d_pos for XZ.
+    Static blocks have zero outgoing velocity and no bounces. Float32 metadata
+    incurs rounding, so displacement comparisons require float32 tolerance.
+    """
     obs_list = []
     depth_list = []
     top_list = [] if capture_top else None
@@ -1558,8 +1577,10 @@ def run_rollout(
     agent_dir_list = []
     # Block info capture (full trajectory length T+1, trimmed to T on return)
     block_pos_list = []
+    k3d_vel_list, k3d_acc_list, k3d_bounce_list = [], [], []
+    k3d = bool(getattr(env.unwrapped, "k3d_mode", False))
 
-    obs, _ = env.reset()
+    obs, _ = env.reset(seed=seed)
     if align_heading_zero:
         env.unwrapped.agent.dir = 0.0
     # Always keep heading in [0, 2π)
@@ -1600,8 +1621,9 @@ def run_rollout(
 
     # Collect first frame
     obs_list.append(rgb)
-    depth = env.unwrapped.render_depth(env.unwrapped.vis_fb)
-    depth_list.append(depth)
+    if capture_depth:
+        depth = env.unwrapped.render_depth(env.unwrapped.vis_fb)
+        depth_list.append(depth)
     # Initial agent state
     agent_pos_list.append(env.unwrapped.agent.pos.copy())
     agent_dir_list.append(_wrap_angle_0_2pi(env.unwrapped.agent.dir))
@@ -1609,20 +1631,27 @@ def run_rollout(
     # Blocks: define a stable ordering within the episode
     block_info_static = None
     blocks = None
+
+    def capture_block_positions():
+        positions = (np.stack([b.pos.copy() for b in blocks], axis=0).astype(np.float32)
+                     if blocks else np.zeros((0, 3), dtype=np.float32))
+        if k3d:
+            positions[:, (0, 2)] = env.unwrapped.k3d_pos
+        block_pos_list.append(positions)
+
     if store_block_info:
         try:
-            blocks = [e for e in env.unwrapped.entities if isinstance(e, Box)]
+            blocks = [e for e in env.unwrapped.entities if isinstance(e, (Box, Ball) if k3d else Box)]
         except Exception:
             blocks = []
         block_info_static = {
             "block_ids": list(range(len(blocks))),
-            "block_colors": [getattr(b, "color", None) for b in blocks],
+            "block_colors": [None if getattr(b, "color", None) is None else str(b.color) for b in blocks],
             "block_textures": [getattr(b, "tex_name", None) for b in blocks],
+            "seed": seed,
+            "num_blocks": int(getattr(env.unwrapped, "num_blocks", len(blocks))),
         }
-        if len(blocks) == 0:
-            block_pos_list.append(np.zeros((0, 3), dtype=np.float32))
-        else:
-            block_pos_list.append(np.stack([b.pos.copy() for b in blocks], axis=0).astype(np.float32))
+        capture_block_positions()
 
     if capture_top:
         # Capture scale once on the first call
@@ -1639,13 +1668,19 @@ def run_rollout(
     act_fn = policy.action
     for t in range(steps):
         a = act_fn(t)
+        if store_block_info and k3d:
+            state = env.unwrapped.k3d_block_state()
+            k3d_acc_list.append(state["acc"])
+            k3d_vel_list.append(np.zeros_like(state["vel"]) if env.unwrapped.blocks_static
+                                 else state["vel"] + state["acc"])
         obs, reward, term, trunc, info = env.step(a)
         # MiniWorld accumulates heading; normalize to [0, 2π) for consistency
         env.unwrapped.agent.dir = _wrap_angle_0_2pi(env.unwrapped.agent.dir)
         rgb = env.render()
         obs_list.append(rgb)
-        depth = env.unwrapped.render_depth(env.unwrapped.vis_fb)
-        depth_list.append(depth)
+        if capture_depth:
+            depth = env.unwrapped.render_depth(env.unwrapped.vis_fb)
+            depth_list.append(depth)
         if capture_top:
             top = env.unwrapped.render_top_view(env.unwrapped.vis_fb, render_agent=True)
             top_list.append(top)
@@ -1654,12 +1689,9 @@ def run_rollout(
         agent_pos_list.append(env.unwrapped.agent.pos.copy())
         agent_dir_list.append(_wrap_angle_0_2pi(env.unwrapped.agent.dir))
         if store_block_info:
-            if blocks is None:
-                blocks = [e for e in env.unwrapped.entities if isinstance(e, Box)]
-            if len(blocks) == 0:
-                block_pos_list.append(np.zeros((0, 3), dtype=np.float32))
-            else:
-                block_pos_list.append(np.stack([b.pos.copy() for b in blocks], axis=0).astype(np.float32))
+            capture_block_positions()
+            if k3d:
+                k3d_bounce_list.append(env.unwrapped.k3d_bounce.copy())
 
         if term or trunc:
             break
@@ -1667,7 +1699,7 @@ def run_rollout(
     # Keep exactly one frame per executed transition (drop the extra terminal frame)
     steps_executed = len(actions)
     rgb_arr = np.stack(obs_list[:steps_executed], axis=0)  # (T,H,W,3)
-    depth_arr = np.stack(depth_list[:steps_executed], axis=0)  # (T,H,W,1)
+    depth_arr = np.stack(depth_list[:steps_executed], axis=0) if capture_depth else None
     actions_arr = np.array(actions, dtype=np.int64)  # (T,)
     top_arr = (
         np.stack(top_list[:steps_executed], axis=0) if (capture_top and top_list) else None
@@ -1722,6 +1754,16 @@ def run_rollout(
             "agent_pos_world": torch.from_numpy(agent_pos.astype(np.float32)),         # (T,3)
             "agent_dir": torch.from_numpy(agent_dir.astype(np.float32)),               # (T,)
         }
+        if k3d:
+            velocity = np.stack(k3d_vel_list).astype(np.float32)
+            block_info.update({
+                "block_acc_world": torch.from_numpy(np.stack(k3d_acc_list).astype(np.float32)),
+                "block_vel_k3d": torch.from_numpy(velocity),
+                "block_speed": torch.from_numpy(np.linalg.norm(velocity, axis=2)),
+                "block_bounce": torch.from_numpy(np.stack(k3d_bounce_list)),
+                "k3d": {name: getattr(env.unwrapped, f"k3d_{name}") for name in
+                        ("integer", "speed_min", "speed_max", "accel_min", "accel_max", "vmax", "bounds")},
+            })
 
     return rgb_arr, depth_arr, actions_arr, top_arr, agent_pos, delta_xz, delta_dir, agent_dir, top_view_scale, block_info
 
@@ -1739,6 +1781,7 @@ def write_mp4_rgb(out_path: str, frames: np.ndarray, fps: int = 15):
         format="FFMPEG",
         pixelformat="yuv420p",
         bitrate="8M",
+        ffmpeg_params=["-threads", "2", "-filter_threads", "2"],
     ) as writer:
         for frame in frames:
             writer.append_data(frame)
@@ -1771,10 +1814,7 @@ def _generate_one(idx: int, ns: SimpleNamespace):
     env_args.no_time_limit = True  # in dataset mode, default to ignore time limit
 
     # Make sure domain randomization can vary per item while still reproducible
-    env = build_env(env_args)
-
-    # Apply seed via gym API
-    env.reset(seed=item_seed)
+    env = build_env(env_args, count_rng=random.Random(item_seed))
 
     policy_kwargs = dict(
         forward_prob=args.forward_prob,
@@ -1798,11 +1838,14 @@ def _generate_one(idx: int, ns: SimpleNamespace):
         observe_steps=args.observe_steps,
         capture_top=(args.debug_join or args.output_2d_map),
         store_block_info=getattr(args, "store_block_info", False),
+        capture_depth=not getattr(args, "no_depth", False),
+        seed=item_seed,
     )
 
     write_mp4_rgb(f"{out_prefix}_rgb.mp4", rgb)
     # Save raw depth (float32) without quantization
-    torch.save(torch.from_numpy(depth).to(torch.float32), f"{out_prefix}_depth.pt")
+    if depth is not None:
+        torch.save(torch.from_numpy(depth).to(torch.float32), f"{out_prefix}_depth.pt")
     meta = {
         "actions": torch.tensor(actions, dtype=torch.long),
         "agent_pos": torch.tensor(agent_pos, dtype=torch.float32),
@@ -1852,6 +1895,7 @@ def main():
     # Observation/depth buffer resolution (used by depth unless overridden)
     parser.add_argument("--obs-width", type=int, default=128)
     parser.add_argument("--obs-height", type=int, default=128)
+    parser.add_argument("--no-depth", action="store_true", help="skip depth rendering and the _depth.pt output")
     parser.add_argument("--top_view", action="store_true")
     parser.add_argument("--domain-rand", action="store_true")
     parser.add_argument("--no-time-limit", action="store_true")
@@ -1871,6 +1915,14 @@ def main():
     parser.add_argument("--grid-vel-min", type=int, default=-1)
     parser.add_argument("--grid-vel-max", type=int, default=1)
     parser.add_argument("--grid-cardinal-only", action="store_true", help="grid mode: restrict block motion to cardinal directions only")
+    parser.add_argument("--k3d-mode", action="store_true", help="continuous kick-drift-mirror blocks with a grid agent")
+    parser.add_argument("--k3d-integer", action="store_true", help="k3d: integer centres, cardinal unit velocity, no acceleration")
+    parser.add_argument("--k3d-speed-min", type=float, default=0.25)
+    parser.add_argument("--k3d-speed-max", type=float, default=1.0)
+    parser.add_argument("--k3d-accel-min", type=float, default=0.0, help="enabled acceleration minimum (0 selects 0.002)")
+    parser.add_argument("--k3d-accel-max", type=float, default=0.0, help="0 disables acceleration; use 0.01 for K3D-a")
+    parser.add_argument("--k3d-vmax", type=float, default=1.2)
+    parser.add_argument("--k3d-bounds", nargs=2, type=float, metavar=("LO", "HI"), help="centre bounds (default 1, room-size - 1)")
     # Block count and color palette controls (MovingBlockWorld)
     parser.add_argument("--num-blocks", type=int, default=None, help="override number of blocks")
     parser.add_argument("--num-blocks-min", type=int, default=None, help="min number of blocks (sampled uniformly if max is set)")
@@ -1937,7 +1989,7 @@ def main():
         run_parallel_dataset(args)
         return
 
-    env = build_env(args)
+    env = build_env(args, count_rng=random.Random(args.seed) if args.seed is not None else None)
     print(f"Miniworld v{miniworld.__version__}, Env: {args.env_name}")
 
     policy_kwargs = dict(
@@ -1962,12 +2014,15 @@ def main():
         observe_steps=args.observe_steps,
         capture_top=(args.debug_join or args.output_2d_map),
         store_block_info=getattr(args, "store_block_info", False),
+        capture_depth=not args.no_depth,
+        seed=args.seed,
     )
 
     # Save outputs
     write_mp4_rgb(f"{args.out_prefix}_rgb.mp4", rgb)
     # Save raw depth (float32) without quantization
-    torch.save(torch.from_numpy(depth).to(torch.float32), f"{args.out_prefix}_depth.pt")
+    if depth is not None:
+        torch.save(torch.from_numpy(depth).to(torch.float32), f"{args.out_prefix}_depth.pt")
     meta = {
         "actions": torch.tensor(actions, dtype=torch.long),
         "agent_pos": torch.tensor(agent_pos, dtype=torch.float32),
