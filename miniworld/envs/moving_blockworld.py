@@ -3,6 +3,7 @@ import math
 import numpy as np
 
 from miniworld.entity import Box, Ball, COLOR_NAMES
+from miniworld import k3d_dynamics
 from miniworld.envs.putnext import PutNext
 from miniworld.math import intersect_circle_segs
 from miniworld.miniworld import MiniWorldEnv
@@ -27,6 +28,10 @@ class MovingBlockWorld(PutNext, utils.EzPickle):
       per-axis velocities for boxes
     - grid_vel_min / grid_vel_max: integer velocity component range for boxes in
       grid mode (inclusive). (0,0) is avoided
+    - k3d_mode: continuous kick-drift-mirror blocks and a grid-aligned agent;
+      mutually exclusive with grid_mode. See miniworld.k3d_dynamics for sampling
+    - k3d_integer: use integer centres and cardinal unit velocities with no
+      acceleration in k3d mode (the released grid path is still grid_mode)
     - block_torus_wrap: if True, boxes wrap across walls (torus); agent unchanged
     """
 
@@ -60,6 +65,14 @@ class MovingBlockWorld(PutNext, utils.EzPickle):
         block_size_xy=None,
         block_height=None,
         agent_center_start=False,
+        k3d_mode=False,
+        k3d_integer=False,
+        k3d_speed_min=0.25,
+        k3d_speed_max=1.0,
+        k3d_accel_min=0.0,
+        k3d_accel_max=0.0,
+        k3d_vmax=1.2,
+        k3d_bounds=None,
         **kwargs,
     ):
         self.box_speed_scale = float(box_speed_scale)
@@ -69,6 +82,18 @@ class MovingBlockWorld(PutNext, utils.EzPickle):
         self.blocks_static = bool(blocks_static)
         self.block_torus_wrap = bool(block_torus_wrap)
         self.grid_mode = bool(grid_mode)
+        self.k3d_mode = bool(k3d_mode)
+        if self.k3d_mode and self.grid_mode:
+            raise ValueError("k3d_mode and grid_mode are mutually exclusive")
+        self.k3d_integer = bool(k3d_integer)
+        self.k3d_speed_min = float(k3d_speed_min)
+        self.k3d_speed_max = float(k3d_speed_max)
+        self.k3d_accel_min = float(k3d_accel_min)
+        self.k3d_accel_max = float(k3d_accel_max)
+        self.k3d_vmax = float(k3d_vmax)
+        self.k3d_bounds = tuple(map(float, k3d_bounds if k3d_bounds is not None else (1.0, size - 1.0)))
+        if self.k3d_mode and self.k3d_accel_max > 0 and self.k3d_accel_min == 0:
+            self.k3d_accel_min = 2e-3
         self.spawn_wall_buffer = float(spawn_wall_buffer) if spawn_wall_buffer is not None else None
         self.grid_vel_min = int(grid_vel_min)
         self.grid_vel_max = int(grid_vel_max)
@@ -134,6 +159,14 @@ class MovingBlockWorld(PutNext, utils.EzPickle):
             wall_tex_randomize=wall_tex_randomize,
             floor_tex_randomize=floor_tex_randomize,
             box_and_ball=box_and_ball,
+            k3d_mode=k3d_mode,
+            k3d_integer=k3d_integer,
+            k3d_speed_min=k3d_speed_min,
+            k3d_speed_max=k3d_speed_max,
+            k3d_accel_min=k3d_accel_min,
+            k3d_accel_max=k3d_accel_max,
+            k3d_vmax=k3d_vmax,
+            k3d_bounds=k3d_bounds,
             **kwargs,
         )
 
@@ -201,7 +234,7 @@ class MovingBlockWorld(PutNext, utils.EzPickle):
             cz = (mnz + mxz) / 2.0
             
             # Adjust snapping per requested convention
-            if self.grid_mode:
+            if self.grid_mode or self.k3d_mode:
                 # Favor top-left if midpoint is exactly an integer; else floor
                 if abs(cx - round(cx)) < 1e-6:
                     cx = round(cx) - 1.0
@@ -304,11 +337,26 @@ class MovingBlockWorld(PutNext, utils.EzPickle):
                 if isinstance(ent, (Box, Ball)):
                     ent.dir = 0.0
 
-        if self.grid_mode:
+        if self.grid_mode or self.k3d_mode:
             self._snap_entity_to_grid(self.agent)
+        if self.grid_mode:
             for ent in self.entities:
                 if isinstance(ent, (Box, Ball)):
                     self._snap_entity_to_grid(ent)
+
+        if self.k3d_mode:
+            self._quantize_heading()
+            self._k3d_blocks = [ent for ent in self.entities if isinstance(ent, (Box, Ball))]
+            self.k3d_pos, self.k3d_vel, self.k3d_acc = k3d_dynamics.sample_blocks(
+                self.np_random, len(self._k3d_blocks), self.k3d_bounds,
+                integer=self.k3d_integer,
+                speed_min=self.k3d_speed_min, speed_max=self.k3d_speed_max,
+                accel_min=self.k3d_accel_min, accel_max=self.k3d_accel_max,
+                vmax=self.k3d_vmax,
+            )
+            self.k3d_bounce = np.zeros_like(self.k3d_pos, dtype=bool)
+            self._sync_k3d_entities()
+            return self.render_obs(), info
 
         # Assign velocities
         rand = self.np_random if self.domain_rand else None
@@ -348,6 +396,21 @@ class MovingBlockWorld(PutNext, utils.EzPickle):
                 ent.velocity = np.array([vx, 0.0, vz], dtype=float)
 
         return obs, info
+
+    def _sync_k3d_entities(self):
+        for ent, pos, vel in zip(self._k3d_blocks, self.k3d_pos, self.k3d_vel):
+            ent.pos[[0, 2]] = pos
+            ent.velocity = np.array([vel[0], 0.0, vel[1]])
+
+    def k3d_block_state(self):
+        """Copy the current state; bounce flags describe the last completed step."""
+        return {
+            "pos": self.k3d_pos.copy(),
+            "vel": self.k3d_vel.copy(),
+            "acc": self.k3d_acc.copy(),
+            "bounce": self.k3d_bounce.copy(),
+            "speed": np.linalg.norm(self.k3d_vel, axis=1),
+        }
 
     def intersect(self, ent, pos, radius):
         # Ignore Y
@@ -428,7 +491,7 @@ class MovingBlockWorld(PutNext, utils.EzPickle):
 
     def step(self, action):
         # Avoid PutNext's reward-based termination by calling MiniWorldEnv.step
-        if self.grid_mode:
+        if self.grid_mode or self.k3d_mode:
             original_params = self.params
             params_copy = self.params.copy()
             params_copy.set("forward_drift", 0.0, 0.0, 0.0)
@@ -438,14 +501,24 @@ class MovingBlockWorld(PutNext, utils.EzPickle):
         else:
             obs, reward, termination, truncation, info = MiniWorldEnv.step(self, action)
 
-        if termination or truncation:
+        if (termination or truncation) and not self.k3d_mode:
             return obs, reward, termination, truncation, info
 
-        if self.grid_mode:
+        if self.grid_mode or self.k3d_mode:
             self._snap_entity_to_grid(self.agent)
             self._quantize_heading()
-            if self.agent.carrying is not None:
+            if self.grid_mode and self.agent.carrying is not None:
                 self._snap_entity_to_grid(self.agent.carrying)
+
+        if self.k3d_mode:
+            if self.blocks_static:
+                self.k3d_bounce.fill(False)
+            else:
+                self.k3d_pos, self.k3d_vel, self.k3d_bounce = k3d_dynamics.step_blocks(
+                    self.k3d_pos, self.k3d_vel, self.k3d_acc, self.k3d_bounds,
+                )
+            self._sync_k3d_entities()
+            return self.render_obs(), reward, termination, truncation, info
 
         carrying = self.agent.carrying
 
