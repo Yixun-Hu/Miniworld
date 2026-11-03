@@ -1768,11 +1768,16 @@ def run_rollout(
     return rgb_arr, depth_arr, actions_arr, top_arr, agent_pos, delta_xz, delta_dir, agent_dir, top_view_scale, block_info
 
 
-def write_mp4_rgb(out_path: str, frames: np.ndarray, fps: int = 15):
+def write_mp4_rgb(out_path: str, frames: np.ndarray, fps: int = 15, ffmpeg_threads: Optional[int] = None):
     import imageio
 
     out_dir = os.path.dirname(out_path) or "."
     os.makedirs(out_dir, exist_ok=True)
+    options = {}
+    if ffmpeg_threads is not None:
+        if ffmpeg_threads < 1:
+            raise ValueError("ffmpeg_threads must be positive")
+        options["ffmpeg_params"] = ["-threads", str(ffmpeg_threads), "-filter_threads", str(ffmpeg_threads)]
     # Use the FFmpeg writer; "quality" is not a valid ffmpeg arg. Use bitrate/CRF instead.
     with imageio.get_writer(
         out_path,
@@ -1781,7 +1786,7 @@ def write_mp4_rgb(out_path: str, frames: np.ndarray, fps: int = 15):
         format="FFMPEG",
         pixelformat="yuv420p",
         bitrate="8M",
-        ffmpeg_params=["-threads", "2", "-filter_threads", "2"],
+        **options,
     ) as writer:
         for frame in frames:
             writer.append_data(frame)
@@ -1842,7 +1847,7 @@ def _generate_one(idx: int, ns: SimpleNamespace):
         seed=item_seed,
     )
 
-    write_mp4_rgb(f"{out_prefix}_rgb.mp4", rgb)
+    write_mp4_rgb(f"{out_prefix}_rgb.mp4", rgb, ffmpeg_threads=getattr(args, "ffmpeg_threads", None))
     # Save raw depth (float32) without quantization
     if depth is not None:
         torch.save(torch.from_numpy(depth).to(torch.float32), f"{out_prefix}_depth.pt")
@@ -1864,10 +1869,10 @@ def _generate_one(idx: int, ns: SimpleNamespace):
             resized = [cv2.resize(f, (W, H), interpolation=cv2.INTER_NEAREST) for f in top]
             top = np.stack(resized, axis=0)
         side_by_side = np.concatenate([rgb, top], axis=2)
-        write_mp4_rgb(f"{out_prefix}_debug.mp4", side_by_side)
+        write_mp4_rgb(f"{out_prefix}_debug.mp4", side_by_side, ffmpeg_threads=getattr(args, "ffmpeg_threads", None))
 
     if args.output_2d_map and top is not None:
-        write_mp4_rgb(f"{out_prefix}_map_2d.mp4", top)
+        write_mp4_rgb(f"{out_prefix}_map_2d.mp4", top, ffmpeg_threads=getattr(args, "ffmpeg_threads", None))
 
     if getattr(args, "store_block_info", False) and block_info is not None:
         torch.save(block_info, f"{out_prefix}_block_info.pt")
@@ -1896,6 +1901,8 @@ def main():
     parser.add_argument("--obs-width", type=int, default=128)
     parser.add_argument("--obs-height", type=int, default=128)
     parser.add_argument("--no-depth", action="store_true", help="skip depth rendering and the _depth.pt output")
+    parser.add_argument("--ffmpeg-threads", type=int, default=None,
+                        help="opt-in FFmpeg encoder/filter thread count; unset preserves the base encoder defaults")
     parser.add_argument("--top_view", action="store_true")
     parser.add_argument("--domain-rand", action="store_true")
     parser.add_argument("--no-time-limit", action="store_true")
@@ -1919,7 +1926,7 @@ def main():
     parser.add_argument("--k3d-integer", action="store_true", help="k3d: integer centres, cardinal unit velocity, no acceleration")
     parser.add_argument("--k3d-speed-min", type=float, default=0.25)
     parser.add_argument("--k3d-speed-max", type=float, default=1.0)
-    parser.add_argument("--k3d-accel-min", type=float, default=0.0, help="enabled acceleration minimum (0 selects 0.002)")
+    parser.add_argument("--k3d-accel-min", type=float, default=0.0, help="enabled acceleration minimum (0 selects min(0.002, accel_max))")
     parser.add_argument("--k3d-accel-max", type=float, default=0.0, help="0 disables acceleration; use 0.01 for K3D-a")
     parser.add_argument("--k3d-vmax", type=float, default=1.2)
     parser.add_argument("--k3d-bounds", nargs=2, type=float, metavar=("LO", "HI"), help="centre bounds (default 1, room-size - 1)")
@@ -1983,6 +1990,8 @@ def main():
     parser.add_argument("--observe-outward-steps", type=int, default=None, help="peekaboo_motion: number of NOOP steps to observe outward at edge (defaults to 4x inward)")
 
     args = parser.parse_args()
+    if args.ffmpeg_threads is not None and args.ffmpeg_threads < 1:
+        parser.error("--ffmpeg-threads must be positive")
 
     # If dataset_root is provided, run parallel generation
     if args.dataset_root:
@@ -2019,7 +2028,7 @@ def main():
     )
 
     # Save outputs
-    write_mp4_rgb(f"{args.out_prefix}_rgb.mp4", rgb)
+    write_mp4_rgb(f"{args.out_prefix}_rgb.mp4", rgb, ffmpeg_threads=args.ffmpeg_threads)
     # Save raw depth (float32) without quantization
     if depth is not None:
         torch.save(torch.from_numpy(depth).to(torch.float32), f"{args.out_prefix}_depth.pt")
@@ -2051,10 +2060,10 @@ def main():
             top = np.stack(resized, axis=0)
 
         side_by_side = np.concatenate([rgb, top], axis=2)
-        write_mp4_rgb(f"{args.out_prefix}_debug.mp4", side_by_side)
+        write_mp4_rgb(f"{args.out_prefix}_debug.mp4", side_by_side, ffmpeg_threads=args.ffmpeg_threads)
 
     if args.output_2d_map and top is not None:
-        write_mp4_rgb(f"{args.out_prefix}_map_2d.mp4", top)
+        write_mp4_rgb(f"{args.out_prefix}_map_2d.mp4", top, ffmpeg_threads=args.ffmpeg_threads)
 
     if getattr(args, "store_block_info", False) and block_info is not None:
         torch.save(block_info, f"{args.out_prefix}_block_info.pt")

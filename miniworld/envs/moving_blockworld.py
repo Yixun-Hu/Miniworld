@@ -93,7 +93,7 @@ class MovingBlockWorld(PutNext, utils.EzPickle):
         self.k3d_vmax = float(k3d_vmax)
         self.k3d_bounds = tuple(map(float, k3d_bounds if k3d_bounds is not None else (1.0, size - 1.0)))
         if self.k3d_mode and self.k3d_accel_max > 0 and self.k3d_accel_min == 0:
-            self.k3d_accel_min = 2e-3
+            self.k3d_accel_min = min(2e-3, self.k3d_accel_max)
         self.spawn_wall_buffer = float(spawn_wall_buffer) if spawn_wall_buffer is not None else None
         self.grid_vel_min = int(grid_vel_min)
         self.grid_vel_max = int(grid_vel_max)
@@ -354,9 +354,12 @@ class MovingBlockWorld(PutNext, utils.EzPickle):
                 accel_min=self.k3d_accel_min, accel_max=self.k3d_accel_max,
                 vmax=self.k3d_vmax,
             )
+            if self.blocks_static:
+                self.k3d_vel.fill(0)
+                self.k3d_acc.fill(0)
             self.k3d_bounce = np.zeros_like(self.k3d_pos, dtype=bool)
             self._sync_k3d_entities()
-            return self.render_obs(), info
+            return obs, info
 
         # Assign velocities
         rand = self.np_random if self.domain_rand else None
@@ -512,13 +515,15 @@ class MovingBlockWorld(PutNext, utils.EzPickle):
 
         if self.k3d_mode:
             if self.blocks_static:
+                self.k3d_vel.fill(0)
+                self.k3d_acc.fill(0)
                 self.k3d_bounce.fill(False)
             else:
                 self.k3d_pos, self.k3d_vel, self.k3d_bounce = k3d_dynamics.step_blocks(
                     self.k3d_pos, self.k3d_vel, self.k3d_acc, self.k3d_bounds,
                 )
             self._sync_k3d_entities()
-            return self.render_obs(), reward, termination, truncation, info
+            return obs, reward, termination, truncation, info
 
         carrying = self.agent.carrying
 

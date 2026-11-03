@@ -1,7 +1,16 @@
 """NumPy-only kick, drift, mirror dynamics for block centres in the XZ plane.
 
 Acceleration is a constant world-frame field and is never reflected. The
-sampler's energy envelope is an initial rejection criterion, not a speed clamp.
+rejection envelope uses |a| * (hi - lo); the exact worst-case potential drop
+over the square is (|a_x| + |a_z|) * (hi - lo). The latter gives an energy-based
+speed envelope of about 1.18 at the defaults, before discrete bounce errors.
+Neither envelope rejects any pairs at the K3D-a defaults. ``vmax`` is not a
+hard bound: review measurements over 4000 blocks found maximum outgoing speeds
+of 1.148 / 1.209 / 1.249 at 500 / 5000 / 50000 steps.
+
+The discrete law conserves |v + a/2|^2/2 - a.p on free steps; reflections can
+change it. For E = |v|^2/2 - a.p, every step satisfies
+|delta E| <= |a|^2/2 + 2|a||v + a|, where v is the pre-kick velocity.
 """
 
 import numpy as np
@@ -32,8 +41,9 @@ def sample_blocks(
 ):
     """Sample ``(pos, vel, acc)`` using the environment's NumPy RNG.
 
-    When acceleration is enabled, a zero ``accel_min`` selects 0.002. Resample
-    each rejected (velocity, acceleration) pair without changing its position.
+    When acceleration is enabled, a zero ``accel_min`` selects
+    min(0.002, accel_max). Resample each rejected (velocity, acceleration) pair
+    without changing its position.
     The required envelope is sqrt(speed**2 + 2*|acc|*(hi-lo)) <= vmax.
     Integer mode uses cardinal unit velocities and zero acceleration.
     """
@@ -55,7 +65,7 @@ def sample_blocks(
     if accel_max < 0 or accel_min < 0:
         raise ValueError("k3d acceleration magnitudes must be nonnegative")
     if accel_max > 0:
-        accel_min = accel_min or 2e-3
+        accel_min = accel_min or min(2e-3, accel_max)
         if accel_min > accel_max:
             raise ValueError("k3d requires accel_min <= accel_max when enabled")
     min_acc = accel_min if accel_max > 0 else 0.0

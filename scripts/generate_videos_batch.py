@@ -28,12 +28,12 @@ Basic usage:
     --steps 300 --room-size 10 --policy center_rotate --agent-center-start
 
 Forwarding convention:
-  All arguments after the positional "--" separator are forwarded verbatim to
+  Arguments after the positional "--" separator are forwarded to
   `scripts.generate_videos` (single-run). This is the recommended place to set
   rollout length, policy, rendering resolution, textures, map/debug outputs,
   --k3d-*, --no-depth, and --store-block-info.
-  Use --seed BEFORE the separator to assign base_seed + item_index to each job.
-  A --seed AFTER the separator is forwarded verbatim (the same seed in each job).
+  A --seed on either side assigns base_seed + item_index to each job.
+  Seeds supplied on both sides must agree.
 
 Key flags:
   --env-name STR            Environment id passed to each subprocess.
@@ -111,7 +111,7 @@ def main():
         action="store_true",
         help="also write <out-prefix>_block_info.pt for each rollout (same as scripts.generate_videos --store-block-info)",
     )
-    # Forward the rest of args verbatim to scripts.generate_videos
+    # Forward generation options, extracting --seed as a batch base seed below.
     parser.add_argument("rest", nargs=argparse.REMAINDER, help="arguments to forward to scripts.generate_videos (must be after --)")
 
     args = parser.parse_args()
@@ -120,8 +120,13 @@ def main():
     fwd = list(args.rest)
     if fwd and fwd[0] == "--":
         fwd = fwd[1:]
-    if args.seed is not None and any(arg == "--seed" or arg.startswith("--seed=") for arg in fwd):
-        parser.error("pass --seed before OR after --, not both")
+    seed_parser = argparse.ArgumentParser(add_help=False, allow_abbrev=False)
+    seed_parser.add_argument("--seed", type=int, action="append", default=[])
+    forwarded, fwd = seed_parser.parse_known_args(fwd)
+    seeds = forwarded.seed + ([args.seed] if args.seed is not None else [])
+    if len(set(seeds)) > 1:
+        parser.error("all --seed values before and after -- must agree")
+    base_seed = seeds[0] if seeds else None
     # If requested, ensure the underlying single-run script gets the flag
     if args.store_block_info and ("--store-block-info" not in fwd):
         fwd = fwd + ["--store-block-info"]
@@ -152,8 +157,8 @@ def main():
             "--out-prefix",
             out_prefix,
         ] + fwd
-        if args.seed is not None:
-            cmd += ["--seed", str(args.seed + idx)]
+        if base_seed is not None:
+            cmd += ["--seed", str(base_seed + idx)]
 
         cmds.append(cmd)
 
